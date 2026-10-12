@@ -24,7 +24,7 @@ use reth_chainspec::{ChainSpec, EthChainSpec, NamedChain};
 use reth_ethereum_primitives::{Block, TransactionSigned};
 use reth_stateless::UncompressedPublicKey;
 use risc0_zkvm::{
-    Digest, ExecutorEnvBuilder, ProverOpts, Receipt, compute_image_id, default_prover,
+    Digest, ExecutorEnvBuilder, ProverOpts, Receipt, SessionStats, compute_image_id, default_prover,
 };
 use std::{
     fs::File,
@@ -132,8 +132,14 @@ impl<P: Provider + DebugApi> BlockProcessor<P> {
     /// Generates a RISC Zero proof of block execution.
     ///
     /// This method is computationally intensive and is run on a blocking thread.
-    pub async fn prove(&self, input: Input, po2: Option<u32>) -> Result<(Receipt, Digest)> {
-        self.prove_with_opts(input, po2, ProverOpts::default()).await
+    pub async fn prove(
+        &self,
+        input: Input,
+        po2: Option<u32>,
+        keccak_max_po2: Option<u32>,
+    ) -> Result<(Receipt, Digest, SessionStats)> {
+        self.prove_with_opts_and_keccak_max_po2(input, po2, keccak_max_po2, ProverOpts::default())
+            .await
     }
 
     /// Generates a RISC Zero proof of block execution using the specified [ProverOpts].
@@ -144,7 +150,21 @@ impl<P: Provider + DebugApi> BlockProcessor<P> {
         input: Input,
         po2: Option<u32>,
         opts: ProverOpts,
-    ) -> Result<(Receipt, Digest)> {
+    ) -> Result<(Receipt, Digest, SessionStats)> {
+        self.prove_with_opts_and_keccak_max_po2(input, po2, None, opts).await
+    }
+
+    /// 生成带有显式 Keccak 证明器批次大小的 RISC Zero 区块执行证明。
+    ///
+    /// 单独暴露 keccak_max_po2，是为了在不改全局默认值的前提下，
+    /// 评估“更大 batch 减少 keccak 请求数”是否能换来更好的总时长。
+    pub async fn prove_with_opts_and_keccak_max_po2(
+        &self,
+        input: Input,
+        po2: Option<u32>,
+        keccak_max_po2: Option<u32>,
+        opts: ProverOpts,
+    ) -> Result<(Receipt, Digest, SessionStats)> {
         let (elf, image_id) = self.elf()?;
 
         // prove in a blocking thread using the default prover
@@ -153,13 +173,16 @@ impl<P: Provider + DebugApi> BlockProcessor<P> {
             if let Some(po2) = po2 {
                 env_builder.segment_limit_po2(po2);
             }
+            if let Some(keccak_max_po2) = keccak_max_po2 {
+                env_builder.keccak_max_po2(keccak_max_po2)?;
+            }
             let env = env_builder.write(&input)?.build()?;
             default_prover().prove_with_opts(env, elf, &opts)
         })
         .await
         .context("prover task panicked")??;
 
-        Ok((info.receipt, image_id))
+        Ok((info.receipt, image_id, info.stats))
     }
 
     /// Gets the input from the filesystem cache, or returns None.
